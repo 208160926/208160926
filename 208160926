@@ -1,0 +1,422 @@
+#include <reg51.h> 
+#include <intrins.h>
+#include <stdio.h>
+#include "ds18b20.h"   
+#include "LCM16X2.h"  
+#define OSC 11059200   
+#define BAUDRATE 9600 
+#define LCM_DB P2 
+unsigned char ucTH,ucTL,Ticks;
+typedef struct
+{
+	int z;//整数部分  
+	int x;//小数部分  
+} Temperature;
+sbit DQ=P3^7;
+sbit LED=P0;  
+sbit LCM_RS=P3^2;   
+sbit LCM_RW=P3^3;
+sbit LCM_E=P3^4;
+sbit LCM_BLC=P3^5;
+sbit AL=P3^6;
+unsigned int data DelayConst = 140;//延迟参数，根据处理器工作频率来设置
+/*LCMDelay
+功能：通过循环的方式延时
+参数：int，表示要延时的毫秒数
+返回：
+*/ 
+void LCMDelay(int ms)	
+{
+	unsigned int i,cnt;
+	cnt = DelayConst *ms;   
+	for(i=0;i<cnt;i++);  
+}
+/*LCMReadState
+功能：查询LCM的忙标志/当前AC地址
+参数：
+返回：BYTE,最高bit为1表示忙，为0表示闲
+*/ 
+unsigned char LCMReadState(void)
+{
+	unsigned char state;
+	LCM_E=0; //E无效    
+	LCM_RS=0; //指定寄存器   
+	LCM_RW=1; //读 
+	LCM_E=1; 
+	_nop_();//等待一个机器周期    
+	_nop_();//等待一个机器周期     
+	state = LCM_DB;//输出   
+	LCM_E = 0;
+	return state;
+}
+/*LCMClear
+功能：清屏
+参数：
+返回：
+*/
+void LCMClear(void)
+{
+	LCMDelay(12);   
+	LCM_E=0;
+	LCM_RS=0; //选择指令寄存器   
+	LCM_RW=0;//写    
+	LCM_DB=0x01;
+	LCM_E=1;
+	_nop_();
+	_nop_();
+	LCM_E = 0;
+	LCMDelay(12);  
+}
+/*LCMWriteCmd
+功能：向LCM写入控制字
+参数：BYTE，命令字节。写入前不判断忙表示（因为初始化过程中不能判断）
+返回：
+*/
+void LCMWriteCmd(unsigned char cmd)
+{
+	LCMDelay(12);
+	LCM_E=0;
+	LCM_RS=0;
+	LCM_RW=0;
+	LCM_DB=cmd;//向cmd控制字      
+	LCM_E=1;
+	_nop_();
+	_nop_();
+	LCM_E = 0;
+}
+/*LCMWriteData
+功能：向LCM写入数据
+参数：BYTE，将要写入的数据
+返回：
+*/
+void LCMWriteData(unsigned char dc)
+{
+	while(LCMReadState()&BUSYFLAG);    
+	LCM_RS=1;//数字寄存器
+	LCM_RW=0;//写  
+	LCM_DB=dc;//写入dc  
+	LCM_E=1;
+	_nop_();
+	_nop_();
+	LCM_E = 0;
+}
+/*LCMInit
+功能：初始化LCM
+参数：DWORD，晶振频率（Hz），供计算延时常数
+返回：
+*/
+void LCMInit(void)
+{
+	LCMDelay(60);//延时60ms，等待LCM复位  
+	LCMWriteCmd(0x38);//功能设置：8位接口，2行，5x7字符点阵
+	LCMDelay(5);//延时   
+	LCMWriteCmd(0x38);//第二次  
+	LCMDelay(1);//延时  
+	LCMWriteCmd(0x38);//此后可以通过检测忙标志判断指令执行情况  
+	while(LCMReadState()&BUSYFLAG);
+	LCMWriteCmd(0x08);//关闭显示	
+	while(LCMReadState()&BUSYFLAG);
+	LCMWriteCmd(0x01);//清屏 
+	while(LCMReadState()&BUSYFLAG);
+	LCMWriteCmd(0x06);//显示地址自动增量，整体不移位  
+	while(LCMReadState()&BUSYFLAG);
+	LCMWriteCmd(0x0e);//开显示，开光标，不闪烁    
+	while(LCMReadState()&BUSYFLAG);
+}
+/*LCMGotoXY
+功能：移动光标到X行Y列
+参数：BYTE，x表示行（0,1），y表示列（横向，取值0~0x0f）
+返回：
+*/
+void LCMGotoXY(unsigned char x,unsigned char y) 
+{
+	unsigned char cmd;
+	if(x==0)
+	{
+		cmd=0x80|y;
+	}
+	else
+	{
+		cmd=0x80|0x40|y;
+	}
+	LCMWriteCmd(cmd); 
+	while(LCMReadState()&BUSYFLAG);
+}
+/*LCMDisplayChar
+功能：在指定位置显示一个字符
+参数：x表示行（0,1），y表示列（横向取值0~0x0f），ch表示将要显示的字符（ASCII码）
+返回：
+*/
+void LCMDisplayChar(unsigned char x, unsigned char y,unsigned char ch)
+{
+	LCMGotoXY(x,y);//移动光标到x行y列   
+	LCMWriteData(ch);//写入ch  
+}
+/*LCMDisplayString
+功能：从指定的位置开始显示字符串
+参数：x表示行（0,1），y表示列（横向取值0~0x0f），*str为指向将要显示的字符串的指针
+返回：
+*/
+void LCMDisplayString(unsigned char x,unsigned char y,unsigned char *str)
+{
+	unsigned char ptr;
+	ptr=0;
+	while(*(str+ptr)!=0)
+	{
+		LCMDisplayChar(x,(y+ptr),*(str+ptr));
+		ptr++;
+	}
+}
+/*LCMBlink
+功能：将指定位置显示的字符闪烁（同时关闭光标）
+参数：x表示行（0,1），y表示列（横向取值0~0x0f），cmd=BLINK：闪烁，NOBLINK：不闪烁
+返回：
+*/
+void LCMBlink(unsigned char x,unsigned char y,unsigned char cmd) 
+{
+	LCMGotoXY(x,y);
+	if(cmd==BLINK)
+	{
+		LCMWriteCmd(0x0d);
+	}
+	else
+	{
+		LCMWriteCmd(0x0c);
+	}
+}
+/*Delay
+功能：通过循环的方式延时
+参数：int
+返回：
+*/
+void Delay(unsigned int i)
+{
+	while(i--);
+}
+/*Reset18B20
+功能：复位18B20并返回芯片存在与否
+参数：
+返回：1表示芯片存在，0表示芯片不存在
+*/
+bit Reset18B20(void)
+{
+	bit x;
+	DQ=1;
+	Delay(96);
+	DQ=0;//主机拉低总线 
+	Delay(960);   
+	DQ=1;//主机释放总线   
+	Delay(96);  
+	x=DQ;
+	Delay(240);
+	if(x==0) 
+		return 1;
+	else 
+		return 0;
+}
+/*DS18B20WriteByte
+功能：向 DS18820  写入一个字节
+参数：
+返回：
+*/	
+void DS18B20WriteByte(unsigned char c)
+{
+	unsigned char ic;
+	for(ic=0;ic<8;ic++)  
+	{	
+		DQ=0;//主机拉低总线，开始写位   
+		DQ=c&0x01;//存最低位，通过右循环，将8位数据写入  
+		Delay(60);
+		DQ=1;//释放总线 
+		c>>=1; //右移  
+	}
+}
+/*DS18B20ReadByte
+功能：从18B20读出一个字节
+参数：
+返回：读出的字节
+*/
+unsigned char DS18B20ReadByte(void)
+{
+	unsigned char c,ic;
+	c=0;
+	for(ic=0;ic<8;ic++)
+	{
+		DQ=0;
+		c>>=1;//右移一位
+		DQ=1;
+		if(DQ) 
+			c|=0x80;//将c的最高位置  
+		Delay(48);
+	}
+	return c;
+}
+/*DS18B20ReadTemperature
+功能：模拟DS18B20检测并输出温度值的所有操作过程，读出温度
+参数：温度（由整数和小数部分构成）
+返回：
+*/
+void DS18B20ReadTemperature(Temperature *t)
+{
+	unsigned char tmpl,tmph;
+	Reset18B20();
+	Delay(144); 
+	DS18B20WriteByte(SkipROM);//跳读，单总线，省时  
+	DS18B20WriteByte(StartConvert);//温度转换  
+	Reset18B20();//复位  
+	Delay(144);   
+	DS18B20WriteByte(SkipROM);//跳读，单总线，省时  
+	DS18B20WriteByte(ReadMemory);//读RAM数据 
+	tmpl=DS18B20ReadByte();//读温度  
+	tmph=DS18B20ReadByte();
+	t->z=(int)((tmph&0x07)<<4|(tmpl&0xf0)>>4); //温度转换计算  
+	t->x=(int)((tmpl&0x0f)*625);
+}
+
+main()
+{
+	unsigned char str[15];    
+	unsigned int i;
+	unsigned char tmph,tmp1;
+	Temperature t;
+	TMOD = 0x21;//选择方式2 作为波特率发生器  
+	SCON = 0x50;//串口方式1，	REN=1  
+    PCON |=0x80;//SMOD=1 
+	TL1 = 256-(OSC/12/16/BAUDRATE);//设置定时器初值 
+	TH1 = 256-(OSC/12/16/BAUDRATE);
+	TR1 = 1;//启动定时器
+	TI = 1;//TI有效
+	//检测DS18B20温度传感器是否存在并复位传感器  
+	if(Reset18B20())
+		printf("\r\n18B20 Reset OK!");
+	else 
+		printf("\r\n18B20 Not present!");
+	LCM_BLC=!LCM_BLC;
+	while(1)//主循环  
+	{
+		Reset18B20();//复位传感器  
+		Delay(144); 
+		DS18B20WriteByte(SkipROM);//跳读，单总线，省时 
+		DS18B20WriteByte(StartConvert); //温度转换 
+		for(i=0;i<40000;i++);//等待   
+		Reset18B20();//复位  
+		Delay(144);   
+		DS18B20WriteByte(SkipROM);//跳读，单总线，省时   
+		DS18B20WriteByte(ReadMemory);//读RAM数据  
+		tmp1=DS18B20ReadByte();
+		tmph=DS18B20ReadByte();
+		printf("\n\rTempersture code HI=%02bX,L0=%02bX",tmph,tmp1);
+		DS18B20ReadTemperature(&t);//读取温度  
+		printf("\nTemperature = %d.%04d",t.z,t.x); //显示当前温度 
+		str[0]='N';
+		str[1]='o';
+		str[2]='w';
+		str[3]=' ';
+		str[4]='t';
+		str[5]='e';
+		str[6]='m';
+		str[7]='p';
+		str[8]=':';
+		str[9]=t.z/10+'0';//十位  
+		str[10]=t.z%10+'0';//个位   
+		str[11]='.';
+		str[12]=t.x/1000+'0';//十分位 
+		str[13]=(t.x/100)%10+'0';//百分位    
+		str[14]=(t.x/10)%10+'0';//千分位
+		str[15]='C';         
+		EA=0;//  停止所有中断    
+		Ticks=0;
+		ucTH=(65536-OSC/12/20)/256;//  计算 50ms 定时的时间常数  
+		ucTL=(65536-OSC/12/20)%256;
+		TMOD=0x21;    
+		TH0=ucTH;
+		TL0=ucTL;
+		ET0=1;// T0 允许中断    
+		TR0=1;//  启动定时器    
+		EA=1;//  打开总中断允许    
+		LCMInit(); //初始化LCM显示器  
+		LCMClear();//清屏    
+		LCMDisplayString(1,0,"Alert temp:30.00");   
+		LCMDisplayString(0,0,str);//输出温度数据到显示屏  
+		LCMBlink(0,15,BLINK);
+		if(t.z>=30)//设置警戒线 
+		{								 
+			AL=0; //蜂鸣器响 
+			P0=0xFF;         
+		    P0=0xFE;
+			LCMDelay (50);  
+			P0=0xDF; //第五个灯亮11101111 
+			LCMDelay (50);   
+			P0=0xBF;//第六个灯亮11011111
+			LCMDelay (50);    
+			P0=0x7F; //第七个灯亮10111111 
+			LCMDelay (50);  
+			P0=0xFF;//第八个灯亮01111111
+          LCMDelay (50);  
+			P0=0xFD;//第一个灯亮11111110
+			LCMDelay (50); 
+			P0=0xFB;//第二个灯亮11111101 
+			LCMDelay (50);  
+			P0=0xF7; //第三个灯亮11111011 
+			LCMDelay (50);   
+			P0=0xEF;//第四个灯亮11110111 
+
+			if(key==0)//判断开关状态
+			{
+			 count++;//计数+1
+			 P1=CharCode[count];//数码管显示计数次数
+			 key=1;//重置开关状态，停止计数
+			 if(count>9)
+			 {
+			 count=0;//9次后清零
+			 }
+			}
+			LCMDisplayString(1,0,"!!!!Warning !!!!");	
+		}
+		if(t.z>=31)//温度超过31摄氏度时，蜂鸣器响起音乐
+		{
+		    unsigned int i=0,j,k;
+			while(SONG_LONG[i]!=0||SONG_TONE[i]!=0)
+			{ 
+			    for(j=0;j<SONG_LONG[i]*20;j++)
+				{
+    					AL=~AL;
+					for(k=0;k<SONG_TONE[i]/3;k++);
+				}
+    			LCMDelay(10);
+    			i++;
+			}
+		}
+		if(28<=t.z&&t.z<30)  
+		{ 
+		  AL=0;    
+		  P0=0xFF; 
+		  LCMDelay (1000);   
+		  AL=1;        
+		  P0=0xFE;
+		  LCMDelay (100);  
+		  P0=0xDF;  //第五个灯亮11101111 
+		  LCMDelay (100);   
+		  P0=0xBF;//第六个灯亮11011111
+		  LCMDelay (100);    
+		  P0=0x7F; //第七个灯亮10111111 
+		  LCMDelay (100);  
+		  P0=0xFF;//第八个灯亮01111111
+         LCMDelay (100);  
+		  P0=0xFD;//第一个灯亮11111110
+		  LCMDelay (100); 
+		  P0=0xFB;//第二个灯亮11111101 
+		  LCMDelay (100);  
+		  P0=0xF7; //第三个灯亮11111011 
+		  LCMDelay (100);   
+		  P0=0xEF;//第四个灯亮11110111 
+
+		  key=0;//将开关状态置零，便于下次计数判断 
+		}
+		else
+		{
+			AL=1;//低于警戒值，蜂鸣器停止  
+			P0=0xff;//全不亮11111111
+		}	
+	}
+}
